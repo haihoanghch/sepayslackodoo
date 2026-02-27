@@ -3,112 +3,151 @@ import json
 import hmac
 import hashlib
 import time
-import xmlrpc.client
-from supabase import create_client
-from slack_sdk import WebClient
+import requests
+from http.server import BaseHTTPRequestHandler
 
-supabase = create_client(
-    os.environ["SUPABASE_URL"],
-    os.environ["SUPABASE_SERVICE_ROLE_KEY"]
-)
+# ENV
+SLACK_SIGNING_SECRET = os.environ.get("SLACK_SIGNING_SECRET")
+SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
-slack_client = WebClient(token=os.environ["SLACK_BOT_TOKEN"])
+# ===============================
+# Helper: Log to Supabase
+# ===============================
+def log_to_supabase(data):
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/slack_logs"
+        headers = {
+            "apikey": SUPABASE_KEY,
+            "Authorization": f"Bearer {SUPABASE_KEY}",
+            "Content-Type": "application/json"
+        }
+        requests.post(url, headers=headers, json=data)
+    except Exception as e:
+        print("Supabase log error:", str(e))
 
-SLACK_SIGNING_SECRET = os.environ["SLACK_SIGNING_SECRET"]
 
-ODOO_URL = os.environ["ODOO_URL"]
-ODOO_DB = os.environ["ODOO_DB"]
-ODOO_USERNAME = os.environ["ODOO_USERNAME"]
-ODOO_PASSWORD = os.environ["ODOO_PASSWORD"]
+# ===============================
+# Helper: Verify Slack Signature
+# ===============================
+def verify_signature(headers, body):
+    timestamp = headers.get("X-Slack-Request-Timestamp")
+    slack_signature = headers.get("X-Slack-Signature")
 
-common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
-uid = common.authenticate(ODOO_DB, ODOO_USERNAME, ODOO_PASSWORD, {})
-models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
+    if not timestamp or not slack_signature:
+        return False
 
+    # chống replay attack
+    if abs(time.time() - int(timestamp)) > 60 * 5:
+        return False
 
-def verify_slack(request):
-    timestamp = request.headers.get("X-Slack-Request-Timestamp")
-    sig_basestring = f"v0:{timestamp}:{request.body.decode()}"
-    my_signature = 'v0=' + hmac.new(
+    basestring = f"v0:{timestamp}:{body.decode('utf-8')}"
+    my_signature = "v0=" + hmac.new(
         SLACK_SIGNING_SECRET.encode(),
-        sig_basestring.encode(),
+        basestring.encode(),
         hashlib.sha256
     ).hexdigest()
 
-    slack_signature = request.headers.get("X-Slack-Signature")
     return hmac.compare_digest(my_signature, slack_signature)
 
 
-def handler(request):
-    if not verify_slack(request):
-        return {"statusCode": 403, "body": "Invalid Slack signature"}
+# ===============================
+# Send message to Slack
+# ===============================
+def send_message(channel, text):
+    try:
+        url = "https://slack.com/api/chat.postMessage"
+        headers = {
+            "Authorization": f"Bearer {SLACK_BOT_TOKEN}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "channel": channel,
+            "text": text
+        }
+        requests.post(url, headers=headers, json=payload)
+    except Exception as e:
+        print("Slack send error:", str(e))
 
-    payload = json.loads(request.form["payload"])
 
-    action = payload["actions"][0]["action_id"]
-    transaction_id = payload["actions"][0]["value"]
-    user_id = payload["user"]["id"]
-    channel = payload["channel"]["id"]
-    ts = payload["message"]["ts"]
+# ===============================
+# Main Handler (Vercel Required)
+# ===============================
+class handler(BaseHTTPRequestHandler):
 
-    record = supabase.table("payment_transactions") \
-        .select("*") \
-        .eq("sepay_transaction_id", transaction_id) \
-        .execute()
+    def do_POST(self):
+        try:
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_length)
 
-    if not record.data:
-        return {"statusCode": 200, "body": "Not found"}
+            # Verify Slack
+            if not verify_signature(self.headers, body):
+                log_to_supabase({
+                    "source": "slack_action",
+                    "status": "signature_failed",
+                    "payload": body.decode("utf-8"),
+                    "error": "Invalid Slack signature"
+                })
+                self.send_response(401)
+                self.end_headers()
+                self.wfile.write(b"Invalid signature")
+                return
 
-    payment = record.data[0]
+            # Parse payload
+            parsed = dict(x.split('=') for x in body.decode().split('&'))
+            payload = json.loads(requests.utils.unquote(parsed.get("payload")))
 
-    # delete original message
-    slack_client.chat_delete(channel=channel, ts=ts)
+            user_id = payload["user"]["id"]
+            channel_id = payload["channel"]["id"]
+            action_id = payload["actions"][0]["action_id"]
+            action_value = payload["actions"][0].get("value")
 
-    if action == "confirm_payment":
-        supabase.table("payment_transactions") \
-            .update({
-                "status": "confirmed",
-                "confirmed_by": user_id
-            }) \
-            .eq("sepay_transaction_id", transaction_id) \
-            .execute()
+            # TRẢ 200 NGAY cho Slack
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"")
 
-        # Odoo log note
-        models.execute_kw(
-            ODOO_DB, uid, ODOO_PASSWORD,
-            'mail.message', 'create',
-            [{
-                'model': 'sale.order',
-                'res_id': payment["so_id"],
-                'body': f'Thanh toán được xác nhận bởi Slack user {user_id}'
-            }]
-        )
+            # =============================
+            # XỬ LÝ LOGIC SAU KHI TRẢ 200
+            # =============================
 
-        slack_client.chat_postMessage(
-            channel=channel,
-            text=f"Đã xác nhận bởi <@{user_id}>"
-        )
+            result_text = ""
 
-    elif action == "report_error":
-        supabase.table("payment_transactions") \
-            .update({"status": "reported"}) \
-            .eq("sepay_transaction_id", transaction_id) \
-            .execute()
+            if action_id == "approve_payment":
+                result_text = f"✅ Thanh toán đã được duyệt bởi <@{user_id}>"
+                status = "approved"
 
-        slack_client.chat_postMessage(
-            channel=channel,
-            text=f"Đã báo sai bởi <@{user_id}>"
-        )
+            elif action_id == "reject_payment":
+                result_text = f"❌ Thanh toán bị từ chối bởi <@{user_id}>"
+                status = "rejected"
 
-    elif action == "cancel_payment":
-        supabase.table("payment_transactions") \
-            .update({"status": "canceled"}) \
-            .eq("sepay_transaction_id", transaction_id) \
-            .execute()
+            else:
+                result_text = f"⚠ Không xác định action: {action_id}"
+                status = "unknown_action"
 
-        slack_client.chat_postMessage(
-            channel=channel,
-            text=f"Đã hủy bởi <@{user_id}>"
-        )
+            # Gửi message lại Slack
+            send_message(channel_id, result_text)
 
-    return {"statusCode": 200, "body": "OK"}
+            # Log success
+            log_to_supabase({
+                "source": "slack_action",
+                "user_id": user_id,
+                "channel_id": channel_id,
+                "action_id": action_id,
+                "action_value": action_value,
+                "status": status,
+                "payload": payload
+            })
+
+        except Exception as e:
+            # Log error
+            log_to_supabase({
+                "source": "slack_action",
+                "status": "error",
+                "error": str(e)
+            })
+
+            self.send_response(500)
+            self.end_headers()
+            self.wfile.write(b"Internal Server Error")
