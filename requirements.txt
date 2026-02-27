@@ -2,3 +2,4 @@ requests
 supabase
 slack_sdk
 xmlrpc-client
+google-generativeai
