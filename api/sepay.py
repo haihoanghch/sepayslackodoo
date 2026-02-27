@@ -1,206 +1,113 @@
 import os
-import re
 import json
 import requests
-from supabase import create_client
-import google.generativeai as genai
-from datetime import datetime
+from http.server import BaseHTTPRequestHandler
 
 # ==============================
-# ENVIRONMENT VARIABLES
+# ENV VARIABLES
 # ==============================
-
-SUPABASE_URL = os.environ["SUPABASE_URL"]
-SUPABASE_KEY = os.environ["SUPABASE_KEY"]
-
-ODOO_URL = os.environ["ODOO_URL"]
-ODOO_DB = os.environ["ODOO_DB"]
-ODOO_USERNAME = os.environ["ODOO_USERNAME"]
-ODOO_PASSWORD = os.environ["ODOO_PASSWORD"]
-
-SLACK_WEBHOOK = os.environ["SLACK_WEBHOOK"]
-GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")
 
 # ==============================
-# INIT CLIENTS
+# LOG TO SUPABASE
 # ==============================
-
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel("gemini-1.5-flash")
-
-# ==============================
-# STEP 1 - REGEX EXTRACT
-# ==============================
-
-def extract_by_regex(content):
-    content = content.upper()
-
-    patterns = [
-        r'HD\s*0*(\d+)',
-        r'HOA\s*DON\s*0*(\d+)',
-        r'\bS(\d{5,})\b',
-        r'\b(\d{4,6})\b'
-    ]
-
-    results = set()
-    for p in patterns:
-        matches = re.findall(p, content)
-        for m in matches:
-            results.add(m)
-
-    return list(results)
-
-# ==============================
-# STEP 2 - GEMINI FALLBACK
-# ==============================
-
-def extract_by_gemini(content):
-    prompt = f"""
-    Extract invoice numbers or sale order numbers from this bank transfer content.
-    Return JSON only:
-    {{
-        "numbers": ["..."]
-    }}
-    Text: {content}
-    """
-
-    response = model.generate_content(prompt)
-
+def log_to_supabase(data):
     try:
-        data = json.loads(response.text)
-        return data.get("numbers", [])
-    except:
-        return []
+        url = f"{SUPABASE_URL}/rest/v1/sepay_logs"
+        headers = {
+            "apikey": SUPABASE_KEY,
+            "Authorization": f"Bearer {SUPABASE_KEY}",
+            "Content-Type": "application/json"
+        }
+        requests.post(url, headers=headers, json=data)
+    except Exception as e:
+        print("Supabase log error:", str(e))
+
 
 # ==============================
-# STEP 3 - CONNECT ODOO
+# SEND MESSAGE TO SLACK
 # ==============================
+def send_to_slack(text):
+    try:
+        url = "https://slack.com/api/chat.postMessage"
+        headers = {
+            "Authorization": f"Bearer {SLACK_BOT_TOKEN}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "channel": "#general",  # đổi channel nếu cần
+            "text": text
+        }
+        requests.post(url, headers=headers, json=payload)
+    except Exception as e:
+        print("Slack send error:", str(e))
 
-def odoo_login():
-    import xmlrpc.client
-
-    common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
-    uid = common.authenticate(ODOO_DB, ODOO_USERNAME, ODOO_PASSWORD, {})
-    models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
-    return uid, models
-
-def find_sale_orders(candidates):
-    uid, models = odoo_login()
-
-    domain = [
-        '|',
-        ('e_invoicenumber', 'in', candidates),
-        ('name', 'in', ['S'+c for c in candidates])
-    ]
-
-    orders = models.execute_kw(
-        ODOO_DB, uid, ODOO_PASSWORD,
-        'sale.order',
-        'search_read',
-        [domain],
-        {'fields': ['name', 'amount_total', 'e_invoicenumber']}
-    )
-
-    return orders
-
-# ==============================
-# STEP 4 - MATCH BY AMOUNT
-# ==============================
-
-def match_by_amount(orders, amount):
-    matched = []
-
-    for o in orders:
-        if abs(float(o["amount_total"]) - float(amount)) < 1:
-            matched.append(o)
-
-    return matched
-
-# ==============================
-# STEP 5 - LOG TO SUPABASE
-# ==============================
-
-def log_payment(data):
-    supabase.table("payment_logs").insert(data).execute()
-
-# ==============================
-# STEP 6 - SEND SLACK
-# ==============================
-
-def send_slack(message):
-    requests.post(SLACK_WEBHOOK, json={"text": message})
 
 # ==============================
 # MAIN HANDLER
 # ==============================
+class handler(BaseHTTPRequestHandler):
 
-def handler(request):
+    def do_POST(self):
+        try:
+            content_length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(content_length)
 
-    if request.method != "POST":
-        return {"statusCode": 405, "body": "Method Not Allowed"}
+            # Parse JSON
+            data = json.loads(body.decode("utf-8"))
 
-    try:
-        payload = request.json()
-        content = payload.get("content", "")
-        amount = payload.get("amount_in", 0)
-        sepay_id = payload.get("id", "")
+            # Trả 200 ngay cho Sepay
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"OK")
 
-        # 1. Regex extract
-        candidates = extract_by_regex(content)
+            # ==========================
+            # XỬ LÝ SAU KHI TRẢ 200
+            # ==========================
 
-        # 2. If empty → Gemini
-        if not candidates:
-            candidates = extract_by_gemini(content)
+            # Hỗ trợ 2 format phổ biến
+            if "data" in data:
+                payload = data["data"]
+            else:
+                payload = data
 
-        # 3. Query Odoo
-        orders = find_sale_orders(candidates)
+            transaction_id = payload.get("transaction_id")
+            amount = payload.get("amount")
+            content = payload.get("content") or payload.get("description")
+            bank_account = payload.get("bank_account") or payload.get("account_number")
+            transfer_time = payload.get("transfer_time")
 
-        # 4. Match amount
-        matched = match_by_amount(orders, amount)
+            # Log vào Supabase
+            log_to_supabase({
+                "source": "sepay",
+                "status": "received",
+                "transaction_id": transaction_id,
+                "amount": amount,
+                "content": content,
+                "bank_account": bank_account,
+                "transfer_time": transfer_time,
+                "raw_payload": payload
+            })
 
-        if len(matched) == 1:
-            status = "matched"
-            send_slack(f"✅ Payment matched: {matched[0]['name']} - {amount}")
+            # Gửi Slack thông báo
+            slack_message = (
+                f"💰 Có giao dịch mới\n"
+                f"Transaction: {transaction_id}\n"
+                f"Số tiền: {amount}\n"
+                f"Nội dung: {content}"
+            )
 
-        elif len(matched) > 1:
-            status = "multiple"
-            send_slack(f"⚠ Multiple matches for {amount}: {matched}")
+            send_to_slack(slack_message)
 
-        elif orders:
-            status = "amount_mismatch"
-            send_slack(f"❌ Amount mismatch. Candidates found but amount not match.")
+        except Exception as e:
+            log_to_supabase({
+                "source": "sepay",
+                "status": "error",
+                "error": str(e)
+            })
 
-        else:
-            status = "not_found"
-            send_slack(f"❌ No sale order found for content: {content}")
-
-        # 5. Log to Supabase
-        log_payment({
-            "sepay_id": sepay_id,
-            "content": content,
-            "amount": amount,
-            "extracted_candidates": candidates,
-            "matched_sale_orders": matched,
-            "match_status": status,
-            "error_message": None,
-            "raw_payload": payload
-        })
-
-        return {"statusCode": 200, "body": "OK"}
-
-    except Exception as e:
-
-        log_payment({
-            "sepay_id": "",
-            "content": "",
-            "amount": 0,
-            "extracted_candidates": [],
-            "matched_sale_orders": [],
-            "match_status": "error",
-            "error_message": str(e),
-            "raw_payload": {}
-        })
-
-        return {"statusCode": 500, "body": str(e)}
+            self.send_response(500)
+            self.end_headers()
+            self.wfile.write(b"Internal Server Error")
