@@ -1,148 +1,206 @@
 import os
 import re
 import json
-import hmac
-import hashlib
-import xmlrpc.client
+import requests
 from supabase import create_client
-from slack_sdk import WebClient
+import google.generativeai as genai
+from datetime import datetime
 
-# ===== INIT =====
-supabase = create_client(
-    os.environ["SUPABASE_URL"],
-    os.environ["SUPABASE_SERVICE_ROLE_KEY"]
-)
+# ==============================
+# ENVIRONMENT VARIABLES
+# ==============================
 
-slack_client = WebClient(token=os.environ["SLACK_BOT_TOKEN"])
+SUPABASE_URL = os.environ["SUPABASE_URL"]
+SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 
 ODOO_URL = os.environ["ODOO_URL"]
 ODOO_DB = os.environ["ODOO_DB"]
 ODOO_USERNAME = os.environ["ODOO_USERNAME"]
 ODOO_PASSWORD = os.environ["ODOO_PASSWORD"]
 
-SEPAY_SECRET = os.environ["SEPAY_SECRET"]
+SLACK_WEBHOOK = os.environ["SLACK_WEBHOOK"]
+GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 
-# ===== ODOO LOGIN =====
-common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
-uid = common.authenticate(ODOO_DB, ODOO_USERNAME, ODOO_PASSWORD, {})
-models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
+# ==============================
+# INIT CLIENTS
+# ==============================
 
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-def verify_sepay_signature(body, signature):
-    expected = hmac.new(
-        SEPAY_SECRET.encode(),
-        body,
-        hashlib.sha256
-    ).hexdigest()
-    return hmac.compare_digest(expected, signature)
+genai.configure(api_key=GEMINI_API_KEY)
+model = genai.GenerativeModel("gemini-1.5-flash")
 
+# ==============================
+# STEP 1 - REGEX EXTRACT
+# ==============================
+
+def extract_by_regex(content):
+    content = content.upper()
+
+    patterns = [
+        r'HD\s*0*(\d+)',
+        r'HOA\s*DON\s*0*(\d+)',
+        r'\bS(\d{5,})\b',
+        r'\b(\d{4,6})\b'
+    ]
+
+    results = set()
+    for p in patterns:
+        matches = re.findall(p, content)
+        for m in matches:
+            results.add(m)
+
+    return list(results)
+
+# ==============================
+# STEP 2 - GEMINI FALLBACK
+# ==============================
+
+def extract_by_gemini(content):
+    prompt = f"""
+    Extract invoice numbers or sale order numbers from this bank transfer content.
+    Return JSON only:
+    {{
+        "numbers": ["..."]
+    }}
+    Text: {content}
+    """
+
+    response = model.generate_content(prompt)
+
+    try:
+        data = json.loads(response.text)
+        return data.get("numbers", [])
+    except:
+        return []
+
+# ==============================
+# STEP 3 - CONNECT ODOO
+# ==============================
+
+def odoo_login():
+    import xmlrpc.client
+
+    common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
+    uid = common.authenticate(ODOO_DB, ODOO_USERNAME, ODOO_PASSWORD, {})
+    models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
+    return uid, models
+
+def find_sale_orders(candidates):
+    uid, models = odoo_login()
+
+    domain = [
+        '|',
+        ('e_invoicenumber', 'in', candidates),
+        ('name', 'in', ['S'+c for c in candidates])
+    ]
+
+    orders = models.execute_kw(
+        ODOO_DB, uid, ODOO_PASSWORD,
+        'sale.order',
+        'search_read',
+        [domain],
+        {'fields': ['name', 'amount_total', 'e_invoicenumber']}
+    )
+
+    return orders
+
+# ==============================
+# STEP 4 - MATCH BY AMOUNT
+# ==============================
+
+def match_by_amount(orders, amount):
+    matched = []
+
+    for o in orders:
+        if abs(float(o["amount_total"]) - float(amount)) < 1:
+            matched.append(o)
+
+    return matched
+
+# ==============================
+# STEP 5 - LOG TO SUPABASE
+# ==============================
+
+def log_payment(data):
+    supabase.table("payment_logs").insert(data).execute()
+
+# ==============================
+# STEP 6 - SEND SLACK
+# ==============================
+
+def send_slack(message):
+    requests.post(SLACK_WEBHOOK, json={"text": message})
+
+# ==============================
+# MAIN HANDLER
+# ==============================
 
 def handler(request):
+
     if request.method != "POST":
         return {"statusCode": 405, "body": "Method Not Allowed"}
 
-    raw_body = request.body
-    signature = request.headers.get("x-sepay-signature", "")
+    try:
+        payload = request.json()
+        content = payload.get("content", "")
+        amount = payload.get("amount_in", 0)
+        sepay_id = payload.get("id", "")
 
-    if not verify_sepay_signature(raw_body, signature):
-        return {"statusCode": 403, "body": "Invalid signature"}
+        # 1. Regex extract
+        candidates = extract_by_regex(content)
 
-    data = json.loads(raw_body)
-    trx = data.get("transaction", {})
+        # 2. If empty → Gemini
+        if not candidates:
+            candidates = extract_by_gemini(content)
 
-    transaction_id = trx.get("id")
-    amount = float(trx.get("amount_in", 0))
-    content = trx.get("transaction_content", "")
+        # 3. Query Odoo
+        orders = find_sale_orders(candidates)
 
-    # ===== CHECK DUPLICATE =====
-    existing = supabase.table("payment_transactions") \
-        .select("*") \
-        .eq("sepay_transaction_id", transaction_id) \
-        .execute()
+        # 4. Match amount
+        matched = match_by_amount(orders, amount)
 
-    if existing.data:
-        return {"statusCode": 200, "body": "Duplicate"}
+        if len(matched) == 1:
+            status = "matched"
+            send_slack(f"✅ Payment matched: {matched[0]['name']} - {amount}")
 
-    # ===== EXTRACT INVOICE =====
-    match = re.search(r'(HD\d+)', content)
-    invoice_number = match.group(1) if match else None
+        elif len(matched) > 1:
+            status = "multiple"
+            send_slack(f"⚠ Multiple matches for {amount}: {matched}")
 
-    so_id = None
-    so_name = None
-    partner_name = None
-    status = "not_match"
+        elif orders:
+            status = "amount_mismatch"
+            send_slack(f"❌ Amount mismatch. Candidates found but amount not match.")
 
-    if invoice_number:
-        orders = models.execute_kw(
-            ODOO_DB, uid, ODOO_PASSWORD,
-            'sale.order', 'search_read',
-            [[['e_invoicenumber', '=', invoice_number]]],
-            {'fields': ['id', 'name', 'amount_total', 'partner_id']}
-        )
+        else:
+            status = "not_found"
+            send_slack(f"❌ No sale order found for content: {content}")
 
-        if orders:
-            order = orders[0]
-            so_id = order["id"]
-            so_name = order["name"]
-            partner_name = order["partner_id"][1]
+        # 5. Log to Supabase
+        log_payment({
+            "sepay_id": sepay_id,
+            "content": content,
+            "amount": amount,
+            "extracted_candidates": candidates,
+            "matched_sale_orders": matched,
+            "match_status": status,
+            "error_message": None,
+            "raw_payload": payload
+        })
 
-            if float(order["amount_total"]) == amount:
-                status = "matched"
+        return {"statusCode": 200, "body": "OK"}
 
-    # ===== INSERT LOG =====
-    insert_res = supabase.table("payment_transactions").insert({
-        "sepay_transaction_id": transaction_id,
-        "invoice_number": invoice_number,
-        "so_id": so_id,
-        "so_name": so_name,
-        "amount": amount,
-        "status": status,
-        "raw_payload": data
-    }).execute()
+    except Exception as e:
 
-    # ===== SEND SLACK IF MATCHED =====
-    if status == "matched":
-        message = f"{so_name} - {amount:,.0f} - {invoice_number} - {partner_name} : KHỚP"
+        log_payment({
+            "sepay_id": "",
+            "content": "",
+            "amount": 0,
+            "extracted_candidates": [],
+            "matched_sale_orders": [],
+            "match_status": "error",
+            "error_message": str(e),
+            "raw_payload": {}
+        })
 
-        slack_res = slack_client.chat_postMessage(
-            channel=os.environ["SLACK_CHANNEL_ID"],
-            text=message,
-            blocks=[
-                {
-                    "type": "section",
-                    "text": {"type": "mrkdwn", "text": message}
-                },
-                {
-                    "type": "actions",
-                    "elements": [
-                        {
-                            "type": "button",
-                            "text": {"type": "plain_text", "text": "Xác nhận"},
-                            "style": "primary",
-                            "action_id": "confirm_payment",
-                            "value": transaction_id
-                        },
-                        {
-                            "type": "button",
-                            "text": {"type": "plain_text", "text": "Báo sai"},
-                            "style": "danger",
-                            "action_id": "report_error",
-                            "value": transaction_id
-                        },
-                        {
-                            "type": "button",
-                            "text": {"type": "plain_text", "text": "Hủy"},
-                            "action_id": "cancel_payment",
-                            "value": transaction_id
-                        }
-                    ]
-                }
-            ]
-        )
-
-        supabase.table("payment_transactions") \
-            .update({"slack_ts": slack_res["ts"]}) \
-            .eq("sepay_transaction_id", transaction_id) \
-            .execute()
-
-    return {"statusCode": 200, "body": "OK"}
+        return {"statusCode": 500, "body": str(e)}
